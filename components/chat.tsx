@@ -1,25 +1,23 @@
 "use client"
 
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import { Button } from "../components/ui/button"
+import { Input } from "../components/ui/input"
 import { Chatbot } from "@prisma/client"
 import { Icons } from "./icons"
-import { Label } from "@/components/ui/label"
-import { Textarea } from "@/components/ui/textarea"
-import { cn } from "@/lib/utils"
+import { Label } from "../components/ui/label"
+import { Textarea } from "../components/ui/textarea"
+import { cn } from "../lib/utils"
 
 import { CardHeader } from "./ui/card"
-import {
-  useAssistant,
-} from '@/hooks/use-assistant';
+import { useChat } from 'ai/react'
 import { Message } from 'ai/react'
 import { useEffect, useRef, useState } from "react"
-import { toast } from "@/components/ui/use-toast"
-import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
-import { FooterText } from "./chat-footer-text";
+import { toast } from "../components/ui/use-toast"
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip"
+import { FooterText } from "./chat-footer-text"
 import { ChatMessage } from "./chat-message"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "./ui/dialog"
-import { useEnterSubmit } from '@/hooks/use-enter-submit'
+import { useEnterSubmit } from '../hooks/use-enter-submit'
 
 interface ChatbotProps {
   chatbot: Chatbot
@@ -39,43 +37,51 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
   const [userMessage, setUserMessage] = useState('')
   const [inquiryLoading, setInquiryLoading] = useState(false)
 
-  let inputFileRef = useRef<HTMLInputElement>(null);
+  const inputFileRef = useRef<HTMLInputElement>(null);
 
-  const [chatThreadId, setChatThreadId] = useState<string | null>()
+  const [chatThreadId, setChatThreadId] = useState<string | null>(null)
 
   const { formRef, onKeyDown } = useEnterSubmit()
 
-  const { status, messages, input, submitMessage, handleInputChange, error, threadId } =
-    useAssistant({ api: `/api/chatbots/${chatbot.id}/chat`, inputFile: inputFileRef.current?.files ? inputFileRef.current.files[0] : undefined, threadId: chatThreadId || '', clientSidePrompt: clientSidePrompt });
+  const { messages, input, handleInputChange, handleSubmit, isLoading, error } =
+    useChat({ api: `/api/chatbots/${chatbot.id}/chat` });
+
+  const handleFileUpload = async (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+      const response = await fetch(`/api/chatbots/${chatbot.id}/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!response.ok) {
+        throw new Error('File upload failed');
+      }
+      toast({
+        title: 'Success',
+        description: 'File uploaded successfully',
+      });
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      toast({
+        title: 'Error',
+        description: 'Failed to upload file',
+        variant: 'destructive'
+      });
+    }
+  };
 
   function handleSubmitMessage(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault()
-
-    submitMessage()
-
+    handleSubmit(e)
     setFileUploaded(false)
     if (inputFileRef.current) {
-
       inputFileRef.current.value = '';
     }
   }
 
-  useEffect(() => {
-    if (threadId) {
-      setChatThreadId(threadId)
-    }
-  }, [threadId])
-
-  useEffect(() => {
-    if (status === 'awaiting_message') {
-      if (inputFileRef.current) {
-        inputFileRef.current.value = '';
-      }
-    }
-  }, [status])
-
-  const containerRef = useRef(null);
-  const inputRef = useRef(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const [fileUploaded, setFileUploaded] = useState(false);
 
@@ -92,7 +98,10 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
 
   useEffect(() => {
     // Scroll to the bottom of the container on messages update
-    document.documentElement.scrollTop = document.getElementById("end").offsetTop;
+    const endElement = document.getElementById("end");
+    if (endElement) {
+      endElement.scrollIntoView({ behavior: 'smooth' });
+    }
   }, [messages]);
 
   async function handleInquirySubmit(e: React.FormEvent<HTMLFormElement>) {
@@ -106,7 +115,7 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
       },
       body: JSON.stringify({
         chatbotId: chatbot.id,
-        threadId: threadId || '',
+        threadId: chatThreadId || '',
         email: userEmail,
         inquiry: userMessage,
       }),
@@ -134,14 +143,13 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
 
   useEffect(() => {
     if (defaultMessage !== '') {
-      input === '' && handleInputChange({ target: { value: defaultMessage } } as React.ChangeEvent<HTMLInputElement>);
+      handleInputChange({ target: { value: defaultMessage } } as React.ChangeEvent<HTMLInputElement>);
     }
-  }, [])
+  }, [defaultMessage, handleInputChange])
 
   function closeChat() {
     window.parent.postMessage('closeChat', '*')
   }
-
 
   return (
     <>
@@ -183,12 +191,10 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
             }
           </div>
         </div>
-
       </CardHeader>
       <div
         className="group w-full overflow-auto pl-0 peer-[[data-state=open]]:lg:pl-[250px] peer-[[data-state=open]]:xl:pl-[300px]"
       >
-
         <div
           className={cn('pb-[200px] overflow-auto pl-5 sm:pl-20 pr-5 sm:pr-20 md:pb-[200px] pt-4 md:pt-10', className)}
         >
@@ -199,20 +205,20 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
                 <ChatMessage chatbot={chatbot} key={index} message={message} />
               );
             })}
-            </div>
-            {status !== "awaiting_message" &&
+          </div>
+          {isLoading &&
             <div className="mt-4">
               <ChatMessage chatbot={chatbot} message={{ id: 'waiting', role: "assistant", content: 'loading' }} />
             </div>
-            }
-            <div id="end" ref={containerRef}> </div>
-          </div>
-          <div className="fixed inset-x-0 bottom-0 w-full ease-in-out animate-in peer-[[data-state=open]]:group-[]:lg:pl-[250px] peer-[[data-state=open]]:group-[]:xl:pl-[300px]">
-            <div className={`mx-auto ${chatbot.chatInputStyle === 'default' ? 'sm:max-w-2xl sm:px-4' : ''}`}>
+          }
+          <div id="end" ref={containerRef}> </div>
+        </div>
+        <div className="fixed inset-x-0 bottom-0 w-full ease-in-out animate-in peer-[[data-state=open]]:group-[]:lg:pl-[250px] peer-[[data-state=open]]:group-[]:xl:pl-[300px]">
+          <div className={`mx-auto ${chatbot.chatInputStyle === 'default' ? 'sm:max-w-2xl sm:px-4' : ''}`}>
             <div className="mb-4 grid grid-cols-1 md:grid-cols-2 gap-2 px-4 ">
               {chatbot.inquiryEnabled && !hideInquiry && messages.length >= chatbot.inquiryDisplayLinkAfterXMessage &&
-              <div className="relative">
-                <button onClick={() => { setHideInquiry(true) }} className="bg-zinc-100 shadow hover:bg-zinc-200 border rounded absolute top-0 right-0 -mt-1 -mr-1">
+                <div className="relative">
+                  <button onClick={() => { setHideInquiry(true) }} className="bg-zinc-100 shadow hover:bg-zinc-200 border rounded absolute top-0 right-0 -mt-1 -mr-1">
                     <Icons.close className="h-4 w-4" />
                   </button>
                   <Dialog open={open} onOpenChange={setOpen}>
@@ -234,13 +240,13 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
                             <Label htmlFor="name" className="text-right">
                               {chatbot.inquiryEmailLabel}
                             </Label>
-                            <Input onChange={(e) => setUserEmail(e.target.value)} className="bg-white" id="email" pattern=".+@.+\..+" type="email" />
+                            <Input onChange={(e: React.ChangeEvent<HTMLInputElement>) => setUserEmail(e.target.value)} className="bg-white" id="email" pattern=".+@.+\..+" type="email" />
                           </div>
                           <div className="gap-4">
                             <Label htmlFor="username" className="text-right">
                               {chatbot.inquiryMessageLabel}
                             </Label>
-                            <Textarea onChange={(e) => setUserMessage(e.target.value)} className="min-h-[100px]" id="message" />
+                            <Textarea onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setUserMessage(e.target.value)} className="min-h-[100px]" id="message" />
                           </div>
                         </div>
                         <DialogFooter>
@@ -256,24 +262,24 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
                   </Dialog>
                 </div>
               }
-
             </div>
-
             <div className="space-y-4 border-t bg-background px-4 py-2 shadow-lg sm:rounded-t-xl md:py-4">
               <form onSubmit={handleSubmitMessage}
                 {...props}
                 ref={formRef}
               >
                 {
-                  fileUploaded &&
+                  fileUploaded && inputFileRef.current?.files?.[0] &&
                   <div className="flex w-full sm:w-1/2 items-center p-2 bg-white border rounded-lg shadow-sm">
                     <Icons.document className="text-gray-400 w-6 h-6 flex-shrink-0" />
                     <div className="flex flex-col pl-3 pr-6 flex-1 min-w-0">
-                      <span className="font-sm text-gray-800 truncate">{inputFileRef.current?.files[0].name}</span>
+                      <span className="font-sm text-gray-800 truncate">{inputFileRef.current.files[0].name}</span>
                       <span className="text-sm text-gray-500">Document</span>
                     </div>
                     <Button type="button" variant="ghost" className="flex-shrink-0" onClick={() => {
-                      inputFileRef.current.value = '';
+                      if (inputFileRef.current) {
+                        inputFileRef.current.value = '';
+                      }
                       setFileUploaded(false);
                     }}>
                       <Icons.close className="text-gray-400 w-4 h-4" />
@@ -295,13 +301,17 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
                         id="file"
                         type="file"
                         className="hidden"
-                        onChange={() => {
-                          setFileUploaded(true)
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            handleFileUpload(file);
+                            setFileUploaded(true);
+                          }
                         }}
                       />
                     </div>
                   }
-                  <div className={chatbot.chatFileAttachementEnabled ?  `pl-4` : `` + ` pr-8`}>
+                  <div className={chatbot.chatFileAttachementEnabled ? `pl-4` : `` + ` pr-8`}>
                     <Textarea
                       ref={inputRef}
                       tabIndex={0}
@@ -322,7 +332,7 @@ export function Chat({ chatbot, defaultMessage, className, withExitX = false, cl
                       <TooltipTrigger asChild>
                         <Button
                           id="submit"
-                          disabled={status !== 'awaiting_message' || input === ''}
+                          disabled={isLoading || input === ''}
                           type="submit" size="icon">
                           <Icons.arrowRight />
                           <span className="sr-only">Send message</span>

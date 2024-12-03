@@ -87,8 +87,9 @@ export async function POST(req: Request) {
     }
 
     const openai = new OpenAI({
-      apiKey: openAIConfig?.globalAPIKey
-    })
+      baseURL: "https://openrouter.ai/api/v1",
+      apiKey: openAIConfig?.globalAPIKey,
+    });
 
     const files = await db.file.findMany({
       select: {

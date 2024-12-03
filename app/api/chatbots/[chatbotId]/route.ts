@@ -1,299 +1,89 @@
-import { authOptions } from "@/lib/auth";
+import { NextRequest, NextResponse } from "next/server";
+import { auth } from "../auth";
 import { db } from "@/lib/db";
-import { chatbotSchema } from "@/lib/validations/chatbot";
-import { getServerSession } from "next-auth";
 import OpenAI from "openai";
-import { z } from "zod";
-import { fileTypes as codeFile } from "@/lib/validations/codeInterpreter";
-import { fileTypes as searchFile } from "@/lib/validations/fileSearch";
+import weaviate, { WeaviateClient } from "weaviate-ts-client";
 
-export const maxDuration = 300;
-
-const routeContextSchema = z.object({
-  params: z.object({
-    chatbotId: z.string(),
-  }),
-})
-
-async function verifyCurrentUserHasAccessToChatbot(chatbotId: string) {
-  const session = await getServerSession(authOptions)
-
-  const count = await db.chatbot.count({
-    where: {
-      id: chatbotId,
-      userId: session?.user?.id,
-    },
-  })
-
-  return count > 0
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error("OPENAI_API_KEY is not set");
 }
 
-export async function GET(
-  req: Request,
-  context: z.infer<typeof routeContextSchema>
+if (!process.env.WEAVIATE_HOST) {
+  throw new Error("WEAVIATE_HOST is not set");
+}
+
+const weaviateClient: WeaviateClient = weaviate.client({
+  scheme: "http",
+  host: process.env.WEAVIATE_HOST,
+});
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+export async function POST(
+  req: NextRequest,
+  { params }: { params: { id: string } }
 ) {
-
-  const { params } = routeContextSchema.parse(context)
-
-  if (!(await verifyCurrentUserHasAccessToChatbot(params.chatbotId))) {
-    return new Response(null, { status: 403 })
-  }
-
   try {
-    const chatbot = await db.chatbot.findUnique({
-      select: {
-        id: true,
-        name: true,
-        createdAt: true,
-      },
-      where: {
-        id: params.chatbotId,
-      },
-    })
+    const session = await auth();
 
-    return new Response(JSON.stringify(chatbot))
-  } catch (error) {
-    return new Response(null, { status: 500 })
-  }
-}
-
-
-export async function PATCH(
-  req: Request,
-  context: z.infer<typeof routeContextSchema>
-) {
-  const session = await getServerSession(authOptions)
-  const { params } = routeContextSchema.parse(context)
-
-  if (!(await verifyCurrentUserHasAccessToChatbot(params.chatbotId))) {
-    return new Response(null, { status: 403 })
-  }
-
-  const openAIConfig = await db.openAIConfig.findUnique({
-    select: {
-      globalAPIKey: true,
-      id: true,
-    },
-    where: {
-      userId: session?.user?.id
+    if (!session) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
     }
-  })
 
-  if (!openAIConfig?.globalAPIKey) {
-    return new Response("Missing your global OpenAI API key, please configure your account.", { status: 400 })
-  }
+    const chatbotId = params.id;
+    const { messages } = await req.json();
 
-  const body = await req.json()
-  const payload = chatbotSchema.parse(body)
+    const chatbot = await db.chatbot.findUnique({
+      where: { id: chatbotId },
+      include: { model: true },
+    });
 
-  try {
-    const openaiTest = new OpenAI({
-      apiKey: payload.openAIKey
-    })
-    await openaiTest.models.list()
-  } catch (error) {
-    return new Response("Invalid OpenAI API key", { status: 400, statusText: "Invalid OpenAI API key" })
-  }
+    if (!chatbot) {
+      return NextResponse.json({ error: "Chatbot not found" }, { status: 404 });
+    }
 
-  try {
-    const chatbot = await db.chatbot.update({
-      where: {
-        id: params.chatbotId
-      },
-      data: {
-        name: payload.name,
-        welcomeMessage: payload.welcomeMessage,
-        prompt: payload.prompt,
-        chatbotErrorMessage: payload.chatbotErrorMessage,
-        openaiKey: payload.openAIKey,
-        modelId: payload.modelId,
-        rightToLeftLanguage: payload.rightToLeftLanguage,
-      },
-      select: {
-        id: true,
-        name: true,
-        openaiId: true,
-        prompt: true,
-        modelId: true,
-      },
-    })
-
-    const currentFiles = await db.chatbotFiles.findMany({
-      where: {
-        chatbotId: chatbot.id,
-      },
-      select: {
-        id: true,
-        fileId: true,
-      }
-    })
+    const userMessage = messages[messages.length - 1].content;
+    let relevantContext = "";
 
     try {
-      await db.chatbotFiles.deleteMany({
-        where: {
-          id: {
-            in: currentFiles.map((file) => file.id)
-          }
-        }
-      })
+      const weaviateResponse = await weaviateClient.graphql
+        .get()
+        .withClassName("Document")
+        .withFields(["content", "filename"])
+        .withNearText({
+          concepts: [userMessage],
+          distance: 0.7,
+        })
+        .withLimit(1)
+        .do();
+
+      relevantContext = weaviateResponse.data.Get.Document[0]?.content || "";
     } catch (error) {
-      console.log("No file to delete")
+      console.error("Error querying Weaviate:", error);
+      // Continue without context if Weaviate query fails
     }
 
-    await db.chatbotFiles.createMany({
-      data: payload.files.map((fileId: string) => ({
-        chatbotId: chatbot.id,
-        fileId: fileId,
-      }))
-    })
+    const contextualizedMessages = [
+      { role: "system", content: chatbot.prompt },
+      { role: "system", content: `Relevant context: ${relevantContext}` },
+      ...messages,
+    ];
 
-    const openai = new OpenAI({
-      apiKey: openAIConfig?.globalAPIKey
-    })
+    const completion = await openai.chat.completions.create({
+      model: chatbot.model?.name || "gpt-3.5-turbo",
+      messages: contextualizedMessages as OpenAI.Chat.ChatCompletionMessage[],
+    });
 
-    const model = await db.chatbotModel.findFirst({
-      where: {
-        id: chatbot.modelId,
-      },
-      select: {
-        id: true,
-        name: true,
-      }
-    })
+    const assistantMessage = completion.choices[0].message;
 
-    const files = await db.file.findMany({
-      where: {
-        id: {
-          in: payload.files
-        },
-      },
-      select: {
-        id: true,
-        name: true,
-        openAIFileId: true,
-      }
-    })
-
-    // validate file extension to create vector store or user code interpreter
-    let bodyTools = {
-      'code_interpreter': {
-        file_ids: []
-      },
-      'file_search': {
-        vector_store_ids: []
-      }
-    };
-
-    // validate file extension to create vector store 
-    const allFileforFileSearch = files.filter((f) => searchFile.includes(f.name.split('.').pop()!));
-    console.log(allFileforFileSearch);
-
-    const allFileforCodeInterpreter = files.filter((f) => codeFile.includes(f.name.split('.').pop()?.toLocaleLowerCase()!));
-    console.log(allFileforCodeInterpreter);
-
-    bodyTools['code_interpreter'] = {
-      file_ids: allFileforCodeInterpreter.map((f) => f.openAIFileId)
-    };
-
-    if (allFileforFileSearch.length > 0) {
-      const vectorStores = await openai.beta.vectorStores.list();
-      const vectorStore = vectorStores.data.find((vs) => vs.name === `Vector Store - ${body.name}`);
-
-      if (vectorStore) {
-        await openai.beta.vectorStores.del(vectorStore.id);
-      }
-
-      const batch = await openai.beta.vectorStores.create({
-        name: `Vector Store - ${body.name}`,
-        file_ids: allFileforFileSearch.map((f) => f.openAIFileId)
-      });
-
-      bodyTools['file_search'] = {
-        vector_store_ids: [batch.id]
-      };
-    }
-
-    await openai.beta.assistants.update(
-      chatbot.openaiId,
-      {
-        name: chatbot.name,
-        instructions: chatbot.prompt,
-        model: model?.name,
-        tools: [{ type: "file_search" }, { type: "code_interpreter" }],
-        tool_resources: {
-          ...bodyTools
-        },
-      }
-    )
-
-    return new Response(JSON.stringify(chatbot))
+    return NextResponse.json({ message: assistantMessage });
   } catch (error) {
-    console.log(error)
-    return new Response(null, { status: 500 })
-  }
-}
-
-export async function DELETE(
-  req: Request,
-  context: z.infer<typeof routeContextSchema>
-) {
-
-  const { params } = routeContextSchema.parse(context)
-
-  if (!(await verifyCurrentUserHasAccessToChatbot(params.chatbotId))) {
-    return new Response(null, { status: 403 })
-  }
-
-  try {
-    const session = await getServerSession(authOptions)
-
-    const chatbot = await db.chatbot.findUnique({
-      select: {
-        id: true,
-        name: true,
-        openaiId: true,
-        isImported: true,
-      },
-      where: {
-        id: params.chatbotId
-      }
-    })
-
-    if (!chatbot!.isImported) {
-      try {
-        const openAIConfig = await db.openAIConfig.findUnique({
-          select: {
-            globalAPIKey: true,
-            id: true,
-          },
-          where: {
-            userId: session?.user?.id
-          }
-        })
-
-        if (!openAIConfig?.globalAPIKey) {
-          return new Response("Missing OpenAI API key", { status: 403 })
-        }
-
-        const openai = new OpenAI({
-          apiKey: openAIConfig?.globalAPIKey
-        })
-
-        await openai.beta.assistants.del(chatbot?.openaiId || '')
-      } catch (error) {
-        console.log(error)
-      }
-    }
-
-    await db.chatbot.delete({
-      where: {
-        id: params.chatbotId
-      }
-    })
-
-    return new Response(null, { status: 204 })
-  } catch (error) {
-    console.log(error)
-    return new Response(null, { status: 500 })
+    console.error("Error in chat route:", error);
+    return NextResponse.json(
+      { error: "Internal server error" },
+      { status: 500 }
+    );
   }
 }

@@ -22,7 +22,7 @@ import { toast } from "@/components/ui/use-toast"
 import { Icons } from "@/components/icons"
 import { chatbotSchema } from "@/lib/validations/chatbot"
 import { ChatbotModel, File, User } from "@prisma/client"
-import Select from 'react-select';
+import Select from 'react-select'
 import { Textarea } from "@/components/ui/textarea"
 import Link from "next/link"
 
@@ -33,9 +33,15 @@ interface NewChatbotProps extends React.HTMLAttributes<HTMLElement> {
     user: Pick<User, "id">
 }
 
-
 export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbotProps) {
     const router = useRouter()
+    const [storedOpenAIKey, setStoredOpenAIKey] = useState<string | null>(null)
+    const [models, setModels] = useState<ChatbotModel[]>([])
+    const [availablesModels, setAvailablesModels] = useState<string[]>([])
+    const [files, setFiles] = useState<File[]>([])
+    const [isSaving, setIsSaving] = useState<boolean>(false)
+    const [isLoadingModels, setIsLoadingModels] = useState<boolean>(true)
+
     const form = useForm<FormData>({
         resolver: zodResolver(chatbotSchema),
         defaultValues: {
@@ -45,30 +51,40 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
         }
     })
 
-    const [models, setModels] = useState<ChatbotModel[]>([])
-    const [availablesModels, setAvailablesModels] = useState<string[]>([])
-    const [files, setFiles] = useState<File[]>([])
-    const [isSaving, setIsSaving] = useState<boolean>(false)
-
     useEffect(() => {
         const init = async () => {
-            const response = await fetch('/api/models', {
-                method: "GET",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-            })
-            const models = await response.json()
-            setModels(models)
+            try {
+                setIsLoadingModels(true)
+                const [modelsResponse, supportedModels, filesResponse, storedKey] = await Promise.all([
+                    fetch('/api/models'),
+                    getAvailableModels(),
+                    getFiles(),
+                    getStoredOpenAIKey()
+                ])
 
-            const supportedModels = await getAvailableModels()
-            setAvailablesModels(supportedModels)
+                if (!modelsResponse.ok) throw new Error('Failed to fetch models')
+                const models = await modelsResponse.json()
+                setModels(models)
+                setAvailablesModels(supportedModels)
+                setFiles(filesResponse)
+                setStoredOpenAIKey(storedKey)
 
-            const filesResponse = await getFiles()
-            setFiles(filesResponse)
+                if (storedKey) {
+                    form.setValue('openAIKey', storedKey)
+                }
+            } catch (error) {
+                console.error('Error initializing form:', error)
+                toast({
+                    title: "Error",
+                    description: "Failed to load necessary data. Please try again.",
+                    variant: "destructive"
+                })
+            } finally {
+                setIsLoadingModels(false)
+            }
         }
         init()
-    }, [])
+    }, [form])
 
     async function getFiles() {
         const response = await fetch('/api/files', {
@@ -77,9 +93,8 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                 "Content-Type": "application/json",
             },
         })
-
-        const files = await response.json()
-        return files
+        if (!response.ok) throw new Error('Failed to fetch files')
+        return response.json()
     }
 
     async function getAvailableModels() {
@@ -89,68 +104,75 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                 "Content-Type": "application/json",
             },
         })
-        const models = await response.json()
-        return models
+        if (!response.ok) throw new Error('Failed to fetch available models')
+        return response.json()
+    }
+
+    async function getStoredOpenAIKey() {
+        const response = await fetch(`/api/users/${props.user.id}/openai`, {
+            method: "GET",
+            headers: {
+                "Content-Type": "application/json",
+            },
+        })
+        if (!response.ok) return null
+        const data = await response.json()
+        return data.openAIKey
     }
 
     async function onSubmit(data: FormData) {
         setIsSaving(true)
-        console.log(data)
-
-        const response = await fetch(`/api/chatbots`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                name: data.name,
-                prompt: data.prompt,
-                openAIKey: data.openAIKey,
-                welcomeMessage: data.welcomeMessage,
-                chatbotErrorMessage: data.chatbotErrorMessage,
-                modelId: data.modelId,
-                files: data.files
-            }),
-        })
-
-        setIsSaving(false)
-
-        if (!response?.ok) {
-            if (response.status === 400) {
-                return toast({
-                    title: "Something went wrong.",
-                    description: await response.text(),
-                    variant: "destructive",
-                })
-            } else if (response.status === 402) {
-                return toast({
-                    title: "Chatbot limit reached.",
-                    description: "Please upgrade to the a higher plan.",
-                    variant: "destructive",
-                })
-            }
-            return toast({
-                title: "Something went wrong.",
-                description: "Your chatbot was not saved. Please try again.",
-                variant: "destructive",
+        try {
+            const response = await fetch(`/api/chatbots`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    name: data.name,
+                    prompt: data.prompt,
+                    openAIKey: data.openAIKey,
+                    welcomeMessage: data.welcomeMessage,
+                    chatbotErrorMessage: data.chatbotErrorMessage,
+                    modelId: data.modelId,
+                    files: data.files
+                }),
             })
-        }
 
-        toast({
-            description: "Your chatbot has been saved.",
-        })
+            if (!response.ok) {
+                if (response.status === 400) {
+                    throw new Error(await response.text())
+                } else if (response.status === 402) {
+                    throw new Error("Chatbot limit reached. Please upgrade to a higher plan.")
+                }
+                throw new Error("Your chatbot was not saved. Please try again.")
+            }
 
-        eventGA({
-            action: 'chatbot_created',
-            label: 'Chatbot Created',
-            value: data.name
-        });
+            toast({
+                description: "Your chatbot has been saved.",
+            })
 
-        router.refresh()
+            eventGA({
+                action: 'chatbot_created',
+                label: 'Chatbot Created',
+                value: data.name
+            })
 
-        if (!isOnboarding) {
-            const object = await response.json()
-            router.push(`/dashboard/chatbots/${object.chatbot.id}/chat`)
+            router.refresh()
+
+            if (!isOnboarding) {
+                const object = await response.json()
+                router.push(`/dashboard/chatbots/${object.chatbot.id}/chat`)
+            }
+        } catch (error) {
+            console.error('Error saving chatbot:', error)
+            toast({
+                title: "Error",
+                description: error instanceof Error ? error.message : "An unexpected error occurred",
+                variant: "destructive"
+            })
+        } finally {
+            setIsSaving(false)
         }
     }
 
@@ -171,7 +193,7 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                                         Display Name
                                     </FormLabel>
                                     <Input
-                                        onChange={field.onChange}
+                                        {...field}
                                         id="name"
                                     />
                                     <FormDescription>
@@ -190,8 +212,7 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                                         Welcome message
                                     </FormLabel>
                                     <Input
-                                        onChange={field.onChange}
-                                        value={field.value}
+                                        {...field}
                                         id="welcomemessage"
                                     />
                                     <FormDescription>
@@ -209,8 +230,7 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                                         Default prompt
                                     </FormLabel >
                                     <Textarea
-                                        onChange={field.onChange}
-                                        value={field.value}
+                                        {...field}
                                         id="prompt"
                                     />
                                     <FormDescription>
@@ -227,12 +247,12 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                             render={({ field }) => (
                                 <FormItem>
                                     <FormLabel htmlFor="files">
-                                        Choose your file for retrival
+                                        Choose your file for retrieval
                                     </FormLabel>
                                     <Select
                                         isMulti
                                         closeMenuOnSelect={false}
-                                        onChange={value => field.onChange(value.map((v) => v.value))}
+                                        onChange={value => field.onChange(value.map((v: any) => v.value))}
                                         defaultValue={field.value}
                                         name="files"
                                         id="files"
@@ -240,7 +260,6 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                                         className="basic-multi-select"
                                         classNamePrefix="select"
                                     />
-
                                     <FormDescription>
                                         The OpenAI model will use this file to search for specific content.
                                         If you don&apos;t have a file yet, it is because you haven&apos;t published any file.
@@ -268,6 +287,7 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                                         }
                                         className="basic-multi-select"
                                         classNamePrefix="select"
+                                        isLoading={isLoadingModels}
                                     />
                                     <FormDescription>
                                         The OpenAI model that will be used to generate responses.
@@ -286,13 +306,15 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                                         OpenAI API Key
                                     </FormLabel>
                                     <Input
-                                        onChange={field.onChange}
+                                        {...field}
                                         id="openAIKey"
                                         type="password"
+                                        placeholder={storedOpenAIKey ? "Using stored API key" : "Enter your OpenAI API key"}
                                     />
                                     <FormDescription>
                                         The OpenAI API key that will be used to generate responses.
                                         You can create your API Key <Link target="_blank" className="underline" href='https://platform.openai.com/api-keys'>here</Link>.
+                                        {storedOpenAIKey && " A stored API key is available. Leave this field empty to use the stored key."}
                                     </FormDescription>
                                     <FormMessage />
                                 </FormItem>
@@ -307,8 +329,7 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                                         Chatbot Error Message
                                     </FormLabel>
                                     <Textarea
-                                        value={field.value}
-                                        onChange={field.onChange}
+                                        {...field}
                                         id="chatbotErrorMessage"
                                     />
                                     <FormDescription>
@@ -323,16 +344,16 @@ export function NewChatbotForm({ isOnboarding, className, ...props }: NewChatbot
                         <button
                             type="submit"
                             className={cn(buttonVariants(), className)}
-                            disabled={isSaving}
+                            disabled={isSaving || isLoadingModels}
                         >
                             {isSaving && (
                                 <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
                             )}
-                            <span>Create</span>
+                            <span>{isSaving ? "Creating..." : "Create"}</span>
                         </button>
                     </CardFooter>
                 </Card>
-            </form >
-        </Form >
+            </form>
+        </Form>
     )
 }
